@@ -5,6 +5,9 @@ package com.github.robfromboulder.viewzoo;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jdk8.Jdk8Module;
+import com.github.robfromboulder.viewzoo.storage.JdbcClient;
+import com.github.robfromboulder.viewzoo.storage.LocalFileSystemClient;
+import com.github.robfromboulder.viewzoo.storage.StorageClient;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Maps;
 import io.trino.spi.TrinoException;
@@ -44,39 +47,36 @@ public class ViewZooMetadata implements ConnectorMetadata {
     @Inject
     public ViewZooMetadata(ViewZooConfig config) {
         this.config = requireNonNull(config, "config is null");
-        this.mapper = new ObjectMapper();
-        mapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
-        mapper.registerModule(new Jdk8Module());
-        if (config.getDir() != null) buildViews();
+        String storage_type = config.getStorageType();
+
+        if (storage_type.equals("filesystem")) {
+            if (config.getDir() != null) {
+                storageClient = new LocalFileSystemClient(config.getDir());
+            }
+            else {
+                throw new TrinoException(CONFIGURATION_INVALID, "Configuration viewzoo.dir not set");
+            }
+        }
+        else if (storage_type.equals("jdbc")) {
+            storageClient = new JdbcClient(config.getJdbcUrl(), config.getJdbcUser(), config.getJdbcPassword());
+        }
+        else {
+            throw new TrinoException(CONFIGURATION_INVALID, "Unsupported storage type: " + storage_type);
+        }
+
+        buildViews();
     }
 
     private final ViewZooConfig config;
-    private final ObjectMapper mapper;
-    private final Map<SchemaTableName, ConnectorViewDefinition> views = new HashMap<>();
+    private final StorageClient storageClient;
+    private Map<SchemaTableName, ConnectorViewDefinition> views;
 
     private synchronized void buildViews() {
-        File dir = new File(config.getDir());
-        if (!dir.isDirectory() && !dir.mkdirs())
-            throw new TrinoException(CONFIGURATION_INVALID, "Unable to access directory: " + config.getDir());
-
-        for (File f : Stream.of(requireNonNull(dir.listFiles())).filter(f -> !f.isHidden() && f.getName().endsWith(".json")).toList()) {
-            try {
-                ConnectorViewDefinition def = mapper.readValue(f, ConnectorViewDefinition.class);
-                String filename = f.getName();
-                String[] name_pieces = filename.split("\\.");
-                if ((name_pieces.length == 3) && name_pieces[2].equals("json"))
-                    views.put(new SchemaTableName(name_pieces[0], name_pieces[1]), def);
-            } catch (IOException e) {
-                throw new TrinoException(GENERIC_INTERNAL_ERROR, "Failed to read file: " + f);
-            }
-        }
+        views = storageClient.getViews();
     }
 
     @Override
     public synchronized void createView(ConnectorSession session, SchemaTableName stn, ConnectorViewDefinition definition, Map<String, Object> viewProperties, boolean replace) {
-        if (config.getDir() == null)
-            throw new TrinoException(CONFIGURATION_INVALID, "Not configured for persistent views");
-
         String schema = stn.getSchemaName();
         String table = stn.getTableName();
         if (schema.contains(".")) {
@@ -89,12 +89,7 @@ public class ViewZooMetadata implements ConnectorMetadata {
             throw new TrinoException(ALREADY_EXISTS, "View already exists: " + stn);
         }
 
-        try {
-            File f = new File(new File(config.getDir()), schema + "." + table + ".json");
-            Files.writeString(Paths.get(f.toURI()), mapper.writeValueAsString(definition));
-        } catch (IOException e) {
-            throw new TrinoException(GENERIC_INTERNAL_ERROR, e.getMessage());
-        }
+        storageClient.createView(schema, table, definition);
     }
 
     @Override
@@ -102,15 +97,11 @@ public class ViewZooMetadata implements ConnectorMetadata {
         if (config.getDir() == null)
             throw new TrinoException(CONFIGURATION_INVALID, "Not configured for persistent views");
 
-        String schema = stn.getSchemaName();
         if (views.remove(stn) == null) throw new ViewNotFoundException(stn);
 
-        try {
-            File f = new File(new File(config.getDir()), schema + "." + stn.getTableName() + ".json");
-            Files.deleteIfExists(Paths.get(f.toURI()));
-        } catch (IOException e) {
-            throw new TrinoException(GENERIC_INTERNAL_ERROR, e.getMessage());
-        }
+        String schema = stn.getSchemaName();
+        String table = stn.getTableName();
+        storageClient.dropView(schema, table);
     }
 
     @Override
